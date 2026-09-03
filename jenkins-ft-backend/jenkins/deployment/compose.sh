@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+
+###############################################################################
+#
+# File        : compose.sh
+# Description : Docker Compose deployment implementation.
+#
+# Responsibilities
+#   - Validate Compose deployment configuration
+#   - Read environment profile
+#   - Resolve project-level defaults
+#   - Apply environment-specific overrides
+#   - Read built image metadata
+#   - Build the exact registry image reference
+#   - Validate remote deployment requirements
+#   - Execute remote deployment script
+#
+###############################################################################
+
+set -Eeuo pipefail
+
+###############################################################################
+# Public Functions
+###############################################################################
+
+deployment_compose() {
+
+    local component="$1"
+
+    ###########################################################################
+    # Variables
+    ###########################################################################
+
+    local profile
+    local profile_file
+    local project_config
+
+    local host
+    local port
+
+    local app_path
+    local compose_file
+    local deploy_script
+
+    local registry_url
+    local registry_namespace
+
+    local health_check_enabled
+    local health_timeout
+
+    local profile_health_check_enabled
+    local profile_health_timeout
+
+    local repository
+    local tag
+    local image_ref
+
+    ###########################################################################
+    # Required commands
+    ###########################################################################
+
+    require_command ssh
+    require_command jq
+    require_command yq
+
+    ###########################################################################
+    # Required Jenkins variables
+    ###########################################################################
+
+    : "${DEPLOY_SSH_USER:?DEPLOY_SSH_USER must be supplied by Jenkins}"
+    : "${DEPLOY_SSH_KEY:?DEPLOY_SSH_KEY must be supplied by Jenkins}"
+    : "${KNOWN_HOSTS_FILE:?KNOWN_HOSTS_FILE must be supplied by Jenkins}"
+
+    : "${REGISTRY_USERNAME:?REGISTRY_USERNAME must be supplied by Jenkins}"
+    : "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD must be supplied by Jenkins}"
+
+    ###########################################################################
+    # Required files
+    ###########################################################################
+
+    require_file "${DEPLOY_SSH_KEY}"
+    require_file "${KNOWN_HOSTS_FILE}"
+    require_file "${PIPELINE_CONTEXT_FILE}"
+
+    ###########################################################################
+    # Project configuration
+    ###########################################################################
+
+    project_config="${JENKINS_DIR}/config/project.json"
+
+    require_file "${project_config}"
+
+    ###########################################################################
+    # Resolve active profile
+    ###########################################################################
+
+    profile="$(
+        json_get "${PIPELINE_CONTEXT_FILE}" ".profile"
+    )" || die "${component}: Failed to extract deployment profile."
+
+    if [[ -z "${profile}" ||
+         "${profile}" == "none" ||
+         "${profile}" == "null" ]]; then
+
+        die "${component}: Deployment profile is not available."
+    fi
+
+    profile_file="${JENKINS_DIR}/config/profiles/${profile}.yaml"
+
+    require_file "${profile_file}"
+
+    ###########################################################################
+    # Resolve target configuration
+    ###########################################################################
+
+    host="$(
+        yq -er '.target.host' "${profile_file}"
+    )" || die "${component}: Missing target.host."
+
+    port="$(
+        yq -er '.target.port // 22' "${profile_file}"
+    )" || die "${component}: Invalid target.port."
+
+    ###########################################################################
+    # Resolve application configuration
+    ###########################################################################
+
+    app_path="$(
+        yq -er '.application.path' "${profile_file}"
+    )" || die "${component}: Missing application.path."
+
+    compose_file="$(
+        yq -er '.application.compose_file' "${profile_file}"
+    )" || die "${component}: Missing application.compose_file."
+
+    deploy_script="$(
+        yq -er '.application.deploy_script' "${profile_file}"
+    )" || die "${component}: Missing application.deploy_script."
+
+    ###########################################################################
+    # Resolve registry configuration
+    ###########################################################################
+
+    registry_url="$(
+        yq -er '.registry.url' "${profile_file}"
+    )" || die "${component}: Missing registry.url."
+
+    registry_namespace="$(
+        yq -er '.registry.namespace' "${profile_file}"
+    )" || die "${component}: Missing registry.namespace."
+
+    ###########################################################################
+    # Resolve project-level health-check defaults
+    ###########################################################################
+
+    health_check_enabled="$(
+        jq -er \
+            ".components.${component}.health_check.enabled" "${project_config}"
+    )" || die "${component}: Missing project health_check.enabled."
+
+    health_timeout="$(
+        jq -er \
+            ".components.${component}.health_check.timeout" "${project_config}"
+    )" || die "${component}: Missing project health_check.timeout."
+    ###########################################################################
+    # Apply optional profile health-check override
+    #
+    # Do not use:
+    #   yq -e
+    #
+    # because boolean false can produce a non-zero exit status.
+    #
+    # Do not use:
+    #   // empty
+    #
+    # because the Jenkins yq parser used by this environment does not
+    # accept the 'empty' expression.
+    ###########################################################################
+
+    profile_health_check_enabled="$(
+        yq -r '.health_check.enabled' "${profile_file}"
+    )" || die "${component}: Failed to read profile health_check.enabled."
+
+    if [[ "${profile_health_check_enabled}" != "null" ]]; then
+
+        case "${profile_health_check_enabled}" in
+            true|false)
+                health_check_enabled="${profile_health_check_enabled}"
+                ;;
+            *)
+                die "${component}: Invalid profile health_check.enabled."
+                ;;
+        esac
+
+    fi
+
+    ###########################################################################
+    # Apply optional profile timeout override
+    ###########################################################################
+
+    profile_health_timeout="$(
+        yq -r '.health_check.timeout' "${profile_file}"
+    )" || die "${component}: Failed to read profile health_check.timeout."
+
+    if [[ "${profile_health_timeout}" != "null" ]]; then
+
+        if ! [[ "${profile_health_timeout}" =~ ^[0-9]+$ ]] ||
+           (( profile_health_timeout <= 0 )); then
+
+            die "${component}: Invalid profile health_check.timeout."
+
+        fi
+
+        health_timeout="${profile_health_timeout}"
+
+    fi
+
+    ###########################################################################
+    # Validate effective health-check configuration
+    ###########################################################################
+
+    case "${health_check_enabled}" in
+        true|false)
+            ;;
+        *)
+            die "${component}: Effective health_check.enabled must be true or false."
+            ;;
+    esac
+
+    if ! [[ "${health_timeout}" =~ ^[0-9]+$ ]] ||
+       (( health_timeout <= 0 )); then
+
+        die "${component}: Effective health_check.timeout must be a positive integer."
+    fi
+
+    ###########################################################################
+    # Resolve runtime Docker image
+    ###########################################################################
+
+    if ! runtime_has_image "${component}"; then
+        die "${component}: No Docker image metadata found."
+    fi
+
+    repository="$(
+        runtime_get_image "${component}" \
+            repository
+    )" || die "${component}: Failed to resolve image repository."
+
+    tag="$(
+        runtime_get_image "${component}" \
+            tag
+    )" || die "${component}: Failed to resolve image tag."
+
+    [[ -n "${repository}" ]] ||
+        die "${component}: Image repository is empty."
+
+    [[ -n "${tag}" ]] ||
+        die "${component}: Image tag is empty."
+
+    ###########################################################################
+    # Build exact image reference
+    ###########################################################################
+
+    image_ref="${registry_url}/${registry_namespace}/${repository}:${tag}"
+
+    ###########################################################################
+    # Deployment information
+    ###########################################################################
+
+    log_info "Deploying '${component}'..."
+    log_info "Profile            : ${profile}"
+    log_info "Host               : ${host}"
+    log_info "Port               : ${port}"
+    log_info "App Path           : ${app_path}"
+    log_info "Compose            : ${compose_file}"
+    log_info "Deploy Script      : ${deploy_script}"
+    log_info "Image              : ${image_ref}"
+    log_info "Health Check       : ${health_check_enabled}"
+    log_info "Health Timeout     : ${health_timeout}s"
+
+    ###########################################################################
+    # SSH configuration
+    ###########################################################################
+
+    local ssh_target="${DEPLOY_SSH_USER}@${host}"
+
+    local -a ssh_options=(
+        -i "${DEPLOY_SSH_KEY}"
+        -p "${port}"
+        -o IdentitiesOnly=yes
+        -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}"
+        -o StrictHostKeyChecking=yes
+        -o ConnectTimeout=10
+        -o BatchMode=yes
+        -o ServerAliveInterval=30
+        -o ServerAliveCountMax=3
+    )
+
+    ###########################################################################
+    # Validate remote deployment files
+    ###########################################################################
+
+    log_info "Validating remote deployment files..."
+
+    local validation_command
+
+    printf -v validation_command \
+        'test -d %q &&
+         test -f %q &&
+         test -x %q' \
+        "${app_path}" \
+        "${app_path}/${compose_file}" \
+        "${app_path}/${deploy_script}"
+
+    if ! ssh "${ssh_options[@]}" \
+        "${ssh_target}" \
+        "${validation_command}"
+    then
+
+        die "${component}: Remote deployment validation failed."
+
+    fi
+
+    log_success \
+        "${component}: Remote deployment files validated."
+
+    ###########################################################################
+    # Execute remote deployment
+    ###########################################################################
+    
+    log_info "Executing remote deployment..."
+
+    local remote_command
+
+    printf -v remote_command \
+        "cd %q && IMAGE=%q REGISTRY_URL=%q HEALTH_CHECK_ENABLED=%q HEALTH_TIMEOUT=%q ./%q" \
+        "${app_path}" \
+        "${image_ref}" \
+        "${registry_url}" \
+        "${health_check_enabled}" \
+        "${health_timeout}" \
+        "${deploy_script}"
+
+    if ! {
+        printf '%s\n' "${REGISTRY_USERNAME}"
+        printf '%s\n' "${REGISTRY_PASSWORD}"
+    } | ssh "${ssh_options[@]}" \
+            "${ssh_target}" \
+            "${remote_command}"
+    then
+
+        die "${component}: Remote deployment failed."
+
+    fi
+
+    ###########################################################################
+    # Success
+    ###########################################################################
+
+    log_success \
+        "${component}: Docker Compose deployment completed successfully."
+}
