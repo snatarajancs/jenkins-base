@@ -1,6 +1,6 @@
 registry:
   type: harbor
-  url: harbor.example.com
+  url: harbor.demotechhub.xyz
   namespace: ft-backend
 
 deployment:
@@ -19,4 +19,4 @@ application:
 
 
 health_check:
-  enabled: false
+  enabled: true
