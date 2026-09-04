@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JENKINS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 readonly REPORT_DIR="${JENKINS_DIR}/reports/trivy"
-readonly TRIVY_CACHE_DIR="${JENKINS_DIR}/runtime/.trivy-cache"
+# readonly TRIVY_CACHE_DIR="${JENKINS_DIR}/runtime/.trivy-cache"
 
 ###############################################################################
 # Load Libraries
@@ -120,7 +120,7 @@ scan_images() {
     ###########################################################################
 
     mkdir -p "${REPORT_DIR}"
-    mkdir -p "${TRIVY_CACHE_DIR}"
+    # mkdir -p "${TRIVY_CACHE_DIR}"
 
     ###########################################################################
     # Scan each image
@@ -207,7 +207,7 @@ scan_images() {
             --entrypoint "" \
             --group-add "${TRIVY_GROUP_ID}" \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
+            # -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
             -v "${REPORT_DIR}:/reports" \
             "${TRIVY_IMAGE}" \
             trivy image \
@@ -231,7 +231,7 @@ scan_images() {
             --entrypoint "" \
             --group-add "${TRIVY_GROUP_ID}" \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
+            # -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
             "${TRIVY_IMAGE}" \
             trivy image \
                 --no-progress \
