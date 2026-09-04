@@ -207,7 +207,6 @@ scan_images() {
             --entrypoint "" \
             --group-add "${TRIVY_GROUP_ID}" \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            # -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
             -v "${REPORT_DIR}:/reports" \
             "${TRIVY_IMAGE}" \
             trivy image \
@@ -231,7 +230,6 @@ scan_images() {
             --entrypoint "" \
             --group-add "${TRIVY_GROUP_ID}" \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            # -v "${TRIVY_CACHE_DIR}:/root/.cache/" \
             "${TRIVY_IMAGE}" \
             trivy image \
                 --no-progress \
